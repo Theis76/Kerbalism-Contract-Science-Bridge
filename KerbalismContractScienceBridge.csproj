@@ -1,0 +1,425 @@
+using System;
+using System.Collections.Generic;
+using System.Reflection;
+using ContractConfigurator.Parameters;
+
+namespace KerbalismContractScienceBridge
+{
+    /// <summary>
+    /// Matches one Kerbalism stock subject ID against the constraints stored in
+    /// Contract Configurator's CollectScienceCustom parameter.
+    ///
+    /// Contract Configurator 2.13.1.0 stores these as protected properties:
+    /// - targetBody
+    /// - biome
+    /// - situation
+    /// - location
+    /// - experiment
+    /// - recoveryMethod
+    ///
+    /// Matching reuses Contract Configurator's own private CheckSubject method
+    /// whenever possible. This is substantially safer than independently
+    /// duplicating its string rules for KSC biomes, situations and locations.
+    ///
+    /// REVIEW FIX (see CHANGES.md item 1): Kerbalism only registers a
+    /// ScienceSubject in the persistent stock R&D database once science is
+    /// actually credited, which can happen long after an experiment starts
+    /// (or never, for a partially-completed run). Relying solely on
+    /// ResearchAndDevelopment.GetSubjectByID() meant "complete on start"
+    /// evidence was silently dropped for every subject R&D had not seen yet
+    /// -- i.e. almost always, since evidence fires at experiment start. We
+    /// now fall back to constructing a transient, non-persisted
+    /// ScienceSubject purely to drive CheckSubject()'s comparison. This
+    /// mirrors the pattern Kerbalism's own legacy science code has used
+    /// (new ScienceSubject(id, title, dataScale, subjectValue, scienceCap)),
+    /// and the object is never added to ResearchAndDevelopment's subject
+    /// list, so it cannot affect R&D totals or persist across a reload.
+    /// </summary>
+    internal static class ContractScienceMatcher
+    {
+        internal static bool TryApplyEvidence(
+            CollectScienceCustom parameter,
+            ScienceEvidence evidence)
+        {
+            if (parameter == null || evidence == null)
+                return false;
+
+            // Starting-work evidence is only meaningful when the bridge is
+            // configured to consider that sufficient on its own. When the
+            // person running the game sets ignoreRecoveryMethod = false in
+            // Settings.cfg, we defer entirely to Contract Configurator's
+            // stock recovery/transmission logic and do not mark anything
+            // complete here. (REVIEW FIX, see CHANGES.md item 2 -- this
+            // setting previously had no effect on matching at all.)
+            if (!BridgeRuntime.Settings.IgnoreRecoveryMethod)
+            {
+                Log.DebugMessage(
+                    "ignoreRecoveryMethod is false; deferring to stock " +
+                    "Contract Configurator recovery logic for " + evidence);
+                return false;
+            }
+
+            Vessel evidenceVessel = FlightGlobals.Vessels.Find(
+                vessel => vessel != null && vessel.id == evidence.VesselId);
+
+            if (evidenceVessel == null)
+            {
+                Log.DebugMessage(
+                    "Evidence vessel is no longer available: " + evidence);
+                return false;
+            }
+
+            if (!IsEvidenceVesselEligible(parameter, evidenceVessel))
+                return false;
+
+            ScienceSubject subject = ResolveSubject(evidence.StockSubjectId);
+
+            if (subject == null)
+            {
+                Log.DebugMessage(
+                    "Could not resolve a subject for " + evidence.StockSubjectId +
+                    "; evidence cannot be safely matched.");
+                return false;
+            }
+
+            Type type = typeof(CollectScienceCustom);
+
+            PropertyInfo experimentProperty =
+                ReflectionUtil.FindProperty(type, "experiment");
+            FieldInfo recoveryDoneField =
+                ReflectionUtil.FindField(type, "recoveryDone");
+            MethodInfo checkSubjectMethod =
+                ReflectionUtil.FindMethod(type, "CheckSubject");
+            MethodInfo updateDelegatesMethod =
+                ReflectionUtil.FindMethod(type, "UpdateDelegates");
+
+            // REVIEW FIX (see CHANGES.md, 0.2.1): CanCheckVesselMeetsCondition
+            // and CheckVessel are not confirmed against the real Contract
+            // Configurator 2.13.1.0 binary -- their names, and CheckVessel's
+            // exact argument count, are best-effort guesses. Treating them as
+            // hard requirements meant a wrong guess would silently disable
+            // the entire bridge, including the parts (CheckSubject-based
+            // matching) that do not depend on them at all. They are now
+            // best-effort: used when found, skipped when not, so a naming
+            // mismatch only loses the extra vessel-binding safety rather
+            // than all completion tracking.
+            MethodInfo canCheckMethod =
+                ReflectionUtil.FindMethod(type, "CanCheckVesselMeetsCondition", 1);
+
+            // CheckVessel is commonly overloaded (e.g. CheckVessel(Vessel) in
+            // stock KSP's VesselParameter vs. a possible two-argument variant
+            // in Contract Configurator's own subclass). Try the most likely
+            // signatures explicitly rather than guessing a single one.
+            MethodInfo checkVesselMethod1Arg =
+                ReflectionUtil.FindMethod(type, "CheckVessel", 1);
+            MethodInfo checkVesselMethod2Arg =
+                ReflectionUtil.FindMethod(type, "CheckVessel", 2);
+
+            if (experimentProperty == null ||
+                recoveryDoneField == null ||
+                checkSubjectMethod == null)
+            {
+                WarnAboutMissingMembersOnce();
+                return false;
+            }
+
+            var experiments =
+                experimentProperty.GetValue(parameter, null) as List<string>;
+            var recoveryDone =
+                recoveryDoneField.GetValue(parameter) as Dictionary<string, bool>;
+
+            if (experiments == null || recoveryDone == null)
+                return false;
+
+            // Do not consume evidence while Contract Configurator says this
+            // parameter cannot yet be evaluated (for example because it is a
+            // later member of a Sequence). Otherwise recoveryDone would retain
+            // the observation and could complete at an unrelated later time.
+            //
+            // Best-effort: if CanCheckVesselMeetsCondition could not be
+            // resolved, or invoking it fails (e.g. because our guessed
+            // 1-argument signature is wrong), we fall back to the 0.1.1
+            // behaviour of proceeding without this extra gate rather than
+            // refusing to match at all.
+            if (canCheckMethod != null)
+            {
+                try
+                {
+                    bool canCheck = (bool)canCheckMethod.Invoke(
+                        parameter, new object[] { evidenceVessel });
+
+                    if (!canCheck)
+                    {
+                        Log.DebugMessage(
+                            "CollectScience is not ready to evaluate vessel " +
+                            evidenceVessel.id + "; evidence left unconsumed.");
+                        return false;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.DebugMessage(
+                        "CanCheckVesselMeetsCondition call failed (" +
+                        ex.Message + "); proceeding without the sequence " +
+                        "readiness gate for this evidence.");
+                }
+            }
+
+            bool changed = false;
+
+            foreach (string experimentId in experiments)
+            {
+                bool match = (bool)checkSubjectMethod.Invoke(
+                    parameter, new object[] { experimentId, subject });
+
+                if (!match)
+                    continue;
+
+                // Extra defensive check: when both sides expose an explicit
+                // experiment ID, require exact equality rather than relying
+                // only on Contract Configurator's Contains() subject-ID test.
+                if (!string.IsNullOrEmpty(experimentId) &&
+                    !string.IsNullOrEmpty(evidence.ExperimentId) &&
+                    !string.Equals(experimentId, evidence.ExperimentId,
+                        StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                if (!recoveryDone.ContainsKey(experimentId))
+                {
+                    recoveryDone[experimentId] = true;
+                    changed = true;
+
+                    Log.DebugMessage(
+                        "Satisfied CollectScience experiment '" + experimentId +
+                        "' from " + evidence);
+                }
+            }
+
+            if (changed)
+            {
+                if (updateDelegatesMethod != null)
+                    updateDelegatesMethod.Invoke(parameter, null);
+
+                // Crucial: CollectScienceCustom is a VesselParameter. Updating
+                // recoveryDone alone changes shared parameter data but does not
+                // associate completion with the vessel that produced the
+                // evidence. Invoke Contract Configurator's own CheckVessel so
+                // VesselParameterGroup tracking, ignored vessel types,
+                // ReadyToComplete(), sequence handling and global state updates
+                // remain authoritative where possible.
+                //
+                // Best-effort: neither the exact overload nor its parameter
+                // types are confirmed against the real 2.13.1.0 binary. We
+                // try the 1-argument form first (matches stock KSP's
+                // VesselParameter.CheckVessel(Vessel)), then the 2-argument
+                // form some Contract Configurator versions may expose, and
+                // fall back to the 0.1.1 behaviour (recoveryDone + delegates
+                // only, no CheckVessel call) if neither invocation succeeds.
+                // That fallback still leaves the parameter correctly
+                // completed for the common non-grouped, single-vessel case;
+                // it only loses the extra VesselParameterGroup bookkeeping
+                // this release is trying to add.
+                if (!TryInvokeCheckVessel(
+                        checkVesselMethod1Arg, checkVesselMethod2Arg,
+                        parameter, evidenceVessel))
+                {
+                    Log.DebugMessage(
+                        "CheckVessel could not be invoked (unresolved or " +
+                        "wrong signature); recoveryDone was still updated " +
+                        "directly, matching 0.1.1 behaviour.");
+                }
+            }
+
+            return changed;
+        }
+
+        /// <summary>
+        /// Attempts CollectScienceCustom.CheckVessel(vessel) first, then
+        /// CheckVessel(vessel, false), swallowing any invocation failure so a
+        /// wrong guess about the signature degrades gracefully instead of
+        /// throwing out of TryApplyEvidence.
+        /// </summary>
+        private static bool TryInvokeCheckVessel(
+            MethodInfo oneArgMethod,
+            MethodInfo twoArgMethod,
+            CollectScienceCustom parameter,
+            Vessel evidenceVessel)
+        {
+            if (oneArgMethod != null)
+            {
+                try
+                {
+                    oneArgMethod.Invoke(parameter, new object[] { evidenceVessel });
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Log.DebugMessage(
+                        "CheckVessel(Vessel) invocation failed: " + ex.Message);
+                }
+            }
+
+            if (twoArgMethod != null)
+            {
+                try
+                {
+                    twoArgMethod.Invoke(
+                        parameter, new object[] { evidenceVessel, false });
+                    return true;
+                }
+                catch (Exception ex)
+                {
+                    Log.DebugMessage(
+                        "CheckVessel(Vessel, bool) invocation failed: " +
+                        ex.Message);
+                }
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Logs the "internals differ" warning at most once per session
+        /// instead of on every CollectScienceCustom.OnUpdate call (which can
+        /// run many times per second), so a genuine API mismatch produces a
+        /// clear diagnostic rather than flooding KSP.log.
+        /// </summary>
+        private static bool hasWarnedAboutMissingMembers;
+
+        private static void WarnAboutMissingMembersOnce()
+        {
+            if (hasWarnedAboutMissingMembers)
+                return;
+
+            hasWarnedAboutMissingMembers = true;
+            Log.Warning(
+                "Contract Configurator internals differ from 2.13.1.0; " +
+                "CollectScience integration disabled for this parameter.");
+        }
+
+        /// <summary>
+        /// Ensures that evidence is applied only to the vessel context that
+        /// Contract Configurator itself would evaluate. Without this guard, an
+        /// observation from vessel A could alter recoveryDone for a parameter
+        /// currently tracking vessel B.
+        /// </summary>
+        private static bool IsEvidenceVesselEligible(
+            CollectScienceCustom parameter, Vessel evidenceVessel)
+        {
+            MethodInfo groupMethod = ReflectionUtil.FindMethod(
+                typeof(CollectScienceCustom), "GetParameterGroupHost");
+
+            if (groupMethod == null)
+                return evidenceVessel.isActiveVessel ||
+                    FlightGlobals.ActiveVessel == null;
+
+            object group = groupMethod.Invoke(parameter, null);
+            if (group != null)
+            {
+                object tracked = ReflectionUtil.Get(group, "TrackedVessel");
+                Vessel trackedVessel = tracked as Vessel;
+
+                // A group without a tracked vessel may still be establishing
+                // its vessel. Let CheckVessel make that decision. Once a
+                // tracked vessel exists, require exact identity.
+                if (trackedVessel != null && trackedVessel.id != evidenceVessel.id)
+                {
+                    Log.DebugMessage(
+                        "Ignoring evidence from vessel " + evidenceVessel.id +
+                        " because the parameter group " +
+                        "tracks vessel " + trackedVessel.id + ".");
+                    return false;
+                }
+
+                return true;
+            }
+
+            // This mirrors VesselParameter.CheckVessel's non-group branch,
+            // which applies its logic only to the active vessel (unless there
+            // is no active vessel). Refusing background evidence here prevents
+            // it from being retained globally and later completing on another
+            // craft after a vessel switch.
+            if (!evidenceVessel.isActiveVessel &&
+                FlightGlobals.ActiveVessel != null)
+            {
+                Log.DebugMessage(
+                    "Ignoring evidence from inactive vessel " +
+                    evidenceVessel.id + " for an ungrouped CollectScience.");
+                return false;
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Resolves a ScienceSubject for CheckSubject() to compare against.
+        ///
+        /// Tries the persistent R&D database first, so an already-registered
+        /// subject (e.g. one credited earlier in the same save) keeps using
+        /// its real, authoritative data. Only when R&D has never seen the
+        /// subject do we build a transient stand-in from the id string plus
+        /// whatever the stock experiment definition can tell us.
+        ///
+        /// The transient object is deliberately never passed to
+        /// ResearchAndDevelopment.AddSubjectToUnlocked() or any other R&D
+        /// mutator: it exists only for the duration of this method call, so
+        /// it cannot change science totals, unlock states or save data.
+        /// </summary>
+        private static ScienceSubject ResolveSubject(string stockSubjectId)
+        {
+            if (string.IsNullOrEmpty(stockSubjectId))
+                return null;
+
+            ScienceSubject subject =
+                ResearchAndDevelopment.GetSubjectByID(stockSubjectId);
+
+            if (subject != null)
+                return subject;
+
+            // Stock subject IDs are "<experimentId>@<situationKey>". We only
+            // need the experiment id to look up dataScale/scienceCap; the
+            // full id is passed through unchanged so CheckSubject's own
+            // body/situation/biome parsing still works exactly as it does
+            // for a real R&D subject.
+            int atIndex = stockSubjectId.IndexOf('@');
+            string experimentId = atIndex > 0
+                ? stockSubjectId.Substring(0, atIndex)
+                : stockSubjectId;
+
+            ScienceExperiment experimentDef =
+                ResearchAndDevelopment.GetExperiment(experimentId);
+
+            // Conservative fallbacks if even the experiment definition is
+            // missing (e.g. a Kerbalism-only experiment with no stock
+            // ScienceExperiment counterpart). These numbers are never
+            // shown to the player and never persisted -- CheckSubject is
+            // expected to key off the subject id string, not these values.
+            float dataScale = experimentDef != null ? experimentDef.dataScale : 1f;
+            float scienceCap = experimentDef != null ? experimentDef.scienceCap : 1f;
+            string title = experimentDef != null
+                ? experimentDef.experimentTitle
+                : experimentId;
+
+            try
+            {
+                subject = new ScienceSubject(
+                    stockSubjectId, title, dataScale, /*subjectValue*/ 1f, scienceCap);
+            }
+            catch (Exception ex)
+            {
+                Log.Warning(
+                    "Failed to build a transient ScienceSubject for " +
+                    stockSubjectId + ": " + ex.Message);
+                return null;
+            }
+
+            Log.DebugMessage(
+                "Built transient (non-persisted) ScienceSubject for " +
+                stockSubjectId + " because R&D has not registered it yet.");
+
+            return subject;
+        }
+    }
+}
